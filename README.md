@@ -69,6 +69,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-© 2025 Copyright
-
-![RED SHADOWS | RS](https://img.shields.io/badge/RED%20SHADOWS%20%7C%20RS-DC143C?style=flat&logo=github&logoColor=white&labelColor=2F2F2F) | ![Shadow-x78](https://img.shields.io/badge/Shadow--x78-000000?style=flat&logo=github&logoColor=white&labelColor=2F2F2F) — **All rights reserved**
+© 2025 Copyright ![RED SHADOWS | RS](https://img.shields.io/badge/RED%20SHADOWS%20%7C%20RS-DC143C?style=flat&logo=github&logoColor=white&labelColor=2F2F2F) | ![Shadow-x78](https://img.shields.io/badge/Shadow--x78-000000?style=flat&logo=github&logoColor=white&labelColor=2F2F2F) — **All rights reserved**
