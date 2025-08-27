@@ -1,155 +1,248 @@
 import re
+import math
 from collections import Counter
 from difflib import SequenceMatcher
-from functools import cached_property
-from typing import List, Set, Optional
-
-ALLOWED_DOMAIN_PREFIXES = ("hotmail.", "outlook.", "live.", "msn.")
-FORBIDDEN_USERNAME_CHARS = "'\"\\/<>|` \t\n\r@:,?&%$;"
-FORBIDDEN_PASSWORD_CHARS = " \t\n\r\v\f"
 
 
-def email_domain_allowed(email: str) -> bool:
+def email_domain_allowed(email):
     try:
-        domain = email.lower().split("@", 1)[1]
-        return domain.startswith(ALLOWED_DOMAIN_PREFIXES)
+        domain = email.lower().split("@")[1]
+        allowed_prefixes = ["hotmail.", "outlook.", "live.", "msn."]
+        return any(domain.startswith(p) for p in allowed_prefixes)
     except (IndexError, AttributeError):
         return False
 
 
 class SpamChecker:
-    HIGH_PRIORITY_KEYWORDS = {"whale", "adm", "bdelahw"}
-    LOW_PRIORITY_KEYWORDS = {"whal", "whan", "duolc", "cloud", "snap"}
-    OBFUSCATED_KEYWORDS = {"snap", "telegram", "articxu", "carpenater"}
+    HIGH_PRIORITY_KEYWORDS = ["whale", "adm", "bdelahw"]
+    LOW_PRIORITY_KEYWORDS = ["whal", "whan", "duolc", "cloud", "tg", "snap"]
+    OBFUSCATED_KEYWORDS = ["snap", "telegram", "articxu", "carpenater"]
+    FORBIDDEN_CHARS = [
+        "'",
+        '"',
+        "\\",
+        "/",
+        "<",
+        ">",
+        "{",
+        "}",
+        "[",
+        "]",
+        ";",
+        ":",
+        "&",
+        "|",
+        "#",
+        "%",
+        "^",
+        "`",
+        "~",
+        "=",
+        "+",
+        ",",
+        "?",
+        "(",
+        ")",
+        "-",
+    ]
 
-    def __init__(
-        self, email: str, password: str, spammy_substrings: Optional[Set[str]] = None
-    ):
-        self.email = email.lower()
+    def __init__(self, email, password):
+        self.email = email
         self.password = password
-        self.spammy_substrings = spammy_substrings or set()
         try:
             self.username, self.domain = self.email.split("@", 1)
         except ValueError:
-            self.username, self.domain = self.email, ""
+            self.username = self.email
+            self.domain = ""
+        self.username_lower = self.username.lower()
+        self.password_lower = self.password.lower()
+        self.username_core = re.sub(r"[^a-z]", "", self.username_lower)
+        self.password_core = re.sub(r"[^a-z]", "", self.password_lower)
+        self.features = self._extract_all_features()
 
-    @cached_property
-    def password_lower(self) -> str:
-        return self.password.lower()
+    def _extract_all_features(self):
+        features = {
+            "username_len": len(self.username),
+            "password_len": len(self.password),
+            "username_entropy": self._calculate_entropy(self.username_lower),
+            "password_entropy": self._calculate_entropy(self.password_lower),
+            "username_transitions": self._count_char_type_transitions(self.username),
+            "password_transitions": self._count_char_type_transitions(self.password),
+            "contains_high_priority_keyword": self._contains_keywords(
+                self.HIGH_PRIORITY_KEYWORDS
+            ),
+            "contains_low_priority_keyword": self._contains_keywords(
+                self.LOW_PRIORITY_KEYWORDS
+            ),
+            "contains_obfuscated_keyword": self._contains_obfuscated_keywords(),
+            "contains_pipe_pattern": "||" in self.password,
+            "contains_telegram_pattern": bool(
+                re.search(r"t\s*[|:_.-]\s*g", self.password_lower)
+            ),
+            "password_contains_url": bool(
+                re.search(r"https?://|t\.me|wa\.me", self.password_lower)
+            ),
+            "contains_forbidden_chars": self._contains_forbidden_chars(),
+            "contains_consecutive_hyphens": "--" in self.username
+            or "--" in self.password,
+            "password_is_doubled": self._is_password_doubled(),
+            "username_is_repetitive": self._is_username_repetitive(),
+            "is_substring": self._is_substring(),
+            "cross_repetition": self._has_cross_repetition(),
+            "composite_similarity": self._calculate_composite_similarity(),
+            "contains_t_g_pattern": self._contains_t_g_pattern(),
+        }
+        features["username_transition_density"] = (
+            (features["username_transitions"] / features["username_len"])
+            if features["username_len"] > 0
+            else 0
+        )
+        features["password_transition_density"] = (
+            (features["password_transitions"] / features["password_len"])
+            if features["password_len"] > 0
+            else 0
+        )
+        return features
 
-    @cached_property
-    def username_core(self) -> str:
-        return re.sub(r"[^a-z]", "", self.username)
+    def _calculate_entropy(self, s):
+        if not s:
+            return 0
+        p, lns = Counter(s), float(len(s))
+        return -sum(count / lns * math.log(count / lns, 2) for count in p.values())
 
-    @cached_property
-    def password_core(self) -> str:
-        return re.sub(r"[^a-z]", "", self.password_lower)
+    def _count_char_type_transitions(self, s):
+        if not s or len(s) < 2:
+            return 0
 
-    def _contains_keywords(self, keyword_set: Set[str]) -> bool:
+        def get_type(char):
+            if char.isdigit():
+                return "digit"
+            if char.isalpha():
+                return "alpha"
+            return "special"
+
+        transitions = 0
+        current_type = get_type(s[0])
+        for char in s[1:]:
+            next_type = get_type(char)
+            if next_type != current_type:
+                transitions += 1
+                current_type = next_type
+        return transitions
+
+    def _contains_keywords(self, keyword_list):
         return any(
             key in self.password_core or key in self.username_core
-            for key in keyword_set
+            for key in keyword_list
         )
 
-    @cached_property
-    def contains_high_priority_keyword(self) -> bool:
-        return self._contains_keywords(self.HIGH_PRIORITY_KEYWORDS)
+    def _contains_obfuscated_keywords(self):
+        for key in self.OBFUSCATED_KEYWORDS:
+            pattern = r"\W*".join(list(key))
+            if re.search(pattern, self.password_lower):
+                return True
+        return False
 
-    @cached_property
-    def contains_low_priority_keyword(self) -> bool:
-        return self._contains_keywords(self.LOW_PRIORITY_KEYWORDS)
+    def _contains_forbidden_chars(self):
+        return any(char in self.password for char in self.FORBIDDEN_CHARS)
 
-    @cached_property
-    def contains_telegram_reference(self) -> bool:
-        pattern = r"telegram|t\.me|\.tg|\btg\b|t\.g"
-        return bool(
-            re.search(pattern, self.email) or re.search(pattern, self.password_lower)
-        )
-
-    @cached_property
-    def username_has_forbidden_chars(self) -> bool:
-        return any(char in FORBIDDEN_USERNAME_CHARS for char in self.username)
-
-    @cached_property
-    def password_has_forbidden_chars(self) -> bool:
-        return any(char in FORBIDDEN_PASSWORD_CHARS for char in self.password)
-
-    @cached_property
-    def contains_spammy_substring(self) -> bool:
-        text_to_check = self.email + self.password_lower
-        return any(sub in text_to_check for sub in self.spammy_substrings)
-
-    @cached_property
-    def password_contains_url(self) -> bool:
-        return bool(re.search(r"https?://|wa\.me", self.password_lower))
-
-    @cached_property
-    def is_password_doubled(self) -> bool:
+    def _is_password_doubled(self):
         pw_len = len(self.password)
         if pw_len > 2 and pw_len % 2 == 0:
             mid = pw_len // 2
-            return self.password[:mid] == self.password[mid:]
+            if self.password[:mid] == self.password[mid:]:
+                return True
         return False
 
-    @cached_property
-    def is_substring(self) -> bool:
-        u_core, p_core = self.username_core, self.password_core
-        return (len(p_core) >= 4 and p_core in u_core) or (
-            len(u_core) >= 4 and u_core in p_core
-        )
+    def _is_username_repetitive(self):
+        username_len = len(self.username_core)
+        if username_len > 12:
+            mid = username_len // 2
+            part1 = self.username_core[:mid]
+            part2 = self.username_core[mid:]
+            if SequenceMatcher(None, part1, part2).ratio() > 0.75:
+                return True
+        return False
 
-    @cached_property
-    def composite_similarity(self) -> float:
-        u_core, p_core = self.username_core, self.password_core
-        sim_ratio_core = SequenceMatcher(None, u_core, p_core).ratio()
-        sim_ratio_reversed = SequenceMatcher(None, u_core, p_core[::-1]).ratio()
+    def _is_substring(self):
+        if len(self.password_core) >= 4 and self.password_core in self.username_core:
+            return True
+        if len(self.username_core) >= 4 and self.username_core in self.password_core:
+            return True
+        return False
+
+    def _has_cross_repetition(self):
+        if (
+            len(self.username_core) > 3
+            and self.password_core.count(self.username_core) >= 2
+        ):
+            return True
+        if (
+            len(self.password_core) > 3
+            and self.username_core.count(self.password_core) >= 2
+        ):
+            return True
+        return False
+
+    def _calculate_composite_similarity(self):
+        sim_ratio_core = SequenceMatcher(
+            None, self.username_core, self.password_core
+        ).ratio()
+        sim_ratio_reversed = SequenceMatcher(
+            None, self.username_core, self.password_core[::-1]
+        ).ratio()
         return max(sim_ratio_core, sim_ratio_reversed)
 
-    def is_spam(self) -> bool:
-        if self.username_has_forbidden_chars or self.password_has_forbidden_chars:
-            return True
-        if self.contains_high_priority_keyword:
+    def _contains_t_g_pattern(self):
+        return bool(re.search(r"t.*?g", self.password_lower))
+
+    def is_spam(self):
+        f = self.features
+        if (
+            f["contains_forbidden_chars"]
+            or f["contains_pipe_pattern"]
+            or f["contains_consecutive_hyphens"]
+        ):
             return True
 
-        spam_flags = [
-            self.contains_low_priority_keyword,
-            self.is_password_doubled,
-            self.is_substring,
-            self.composite_similarity > 0.80,
-            self.contains_spammy_substring,
-            self.contains_telegram_reference,
-            self.password_contains_url,
+        if (
+            not f["contains_high_priority_keyword"]
+            and not f["contains_low_priority_keyword"]
+        ):
+            return f["contains_obfuscated_keyword"]
+
+        spam_conditions = [
+            f["cross_repetition"],
+            f["password_contains_url"],
+            f["contains_telegram_pattern"],
+            f["contains_obfuscated_keyword"],
+            f["password_is_doubled"],
+            f["username_is_repetitive"],
+            f["password_len"] > 60,
+            f["composite_similarity"] > 0.45,
+            f["is_substring"],
+            f["username_len"] > 20 and f["username_transition_density"] > 0.3,
+            f["contains_high_priority_keyword"],
+            f["contains_t_g_pattern"],
         ]
+        return any(spam_conditions)
 
-        if sum(spam_flags) >= 2:
-            return True
 
+seen_passwords = set()
+
+
+def checker_combo(line):
+    try:
+        email, password = line.strip().split(":", 1)
+
+        if password in seen_passwords:
+            return False
+
+        seen_passwords.add(password)
+
+        if not email_domain_allowed(email):
+            return False
+        checker = SpamChecker(email, password)
+        return not checker.is_spam()
+    except Exception:
         return False
-
-
-def filter_combos(file_content: str) -> List[str]:
-    lines = [line.strip() for line in file_content.strip().split("\n") if ":" in line]
-
-    substring_counts = Counter(
-        part
-        for line in lines
-        for part in re.split(
-            r"[@._\-|]", (line.split(":", 1)[0] + line.split(":", 1)[1]).lower()
-        )
-        if len(part) >= 5
-    )
-    spammy_substrings = {part for part, count in substring_counts.items() if count > 5}
-
-    valid_lines = []
-    for line in lines:
-        try:
-            email, password = line.split(":", 1)
-            checker = SpamChecker(email, password, spammy_substrings)
-
-            if not checker.is_spam():
-                valid_lines.append(line)
-
-        except ValueError:
-            continue
-
-    return valid_lines

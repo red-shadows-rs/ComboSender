@@ -1,7 +1,3 @@
-import os
-import random
-import re
-from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     CommandHandler,
@@ -10,372 +6,557 @@ from telegram.ext import (
     CallbackContext,
     ConversationHandler,
     CallbackQueryHandler,
-    Application,
 )
 from telethon import events
+import os
+import re
 from src.data.database import c, conn
-from src.utils.checker import filter_combos
+from src.utils.checker import checker_combo
 from src.session.telethon_session import telethon_client
 from config import ADMIN_IDS
 
+ADD_INPUT, ADD_OUTPUT = range(2)
 TEMP_DIR = "temp"
 
-
-class STATE:
-    ADD_INPUT = 0
-    ADD_OUTPUT = 1
-    ADD_RIGHTS = 2
-
-
-class CALLBACK:
-    CHANNELS = "channels"
-    ADD_INPUT = "add_input"
-    ADD_OUTPUT = "add_output"
-    SKIP_RIGHTS = "skip_rights"
-    BACK_TO_MAIN = "back_to_main"
-    DELETE_INPUT_PREFIX = "del_input:"
-    DELETE_OUTPUT_PREFIX = "del_output:"
+input_channels = set(
+    row[0] for row in c.execute("SELECT channel_id FROM input_channels")
+)
+output_channels = [
+    (row[0], row[1])
+    for row in c.execute("SELECT channel_id, file_name FROM output_channels")
+]
 
 
-def get_db_input_channels() -> set:
-    return {row[0] for row in c.execute("SELECT channel_id FROM input_channels")}
-
-
-def get_db_output_channels() -> list:
-    return c.execute("SELECT channel_id, file_name FROM output_channels").fetchall()
-
-
-def admin_only(func):
-
-    @wraps(func)
-    async def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
+def is_admin(update):
+    user_id = None
+    if hasattr(update, "effective_user") and update.effective_user:
         user_id = update.effective_user.id
-        if user_id not in ADMIN_IDS:
-            message = "🚫 You are not authorized to perform this action."
-            if update.callback_query:
-                await update.callback_query.answer(message, show_alert=True)
-            elif update.message:
-                await update.message.reply_text(message)
-            return
-        return await func(update, context, *args, **kwargs)
+    elif hasattr(update, "message") and update.message and update.message.from_user:
+        user_id = update.message.from_user.id
+    elif (
+        hasattr(update, "callback_query")
+        and update.callback_query
+        and update.callback_query.from_user
+    ):
+        user_id = update.callback_query.from_user.id
+    return user_id in ADMIN_IDS
 
-    return wrapped
 
-
-@admin_only
 async def start(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        message = getattr(update, "message", None)
+        if (
+            message is None
+            and hasattr(update, "callback_query")
+            and update.callback_query
+        ):
+            message = update.callback_query.message
+        await message.reply_text("🚫 You are not authorized to use this bot.")
+        return
+    message = getattr(update, "message", None)
+    if message is None and hasattr(update, "callback_query") and update.callback_query:
+        message = update.callback_query.message
     input_count = c.execute("SELECT COUNT(*) FROM input_channels").fetchone()[0]
     output_count = c.execute("SELECT COUNT(*) FROM output_channels").fetchone()[0]
-
-    stats = f"📊 <b>Stats:</b>\nInput Channels: {input_count}\nOutput Channels: {output_count}"
-    text = (
+    stats = f"📊 Stats:\nInput Channels: <b>{input_count}</b>\nOutput Channels: <b>{output_count}</b>"
+    welcome_text = (
         "👋 <b>Welcome to ComboSender Bot!</b>\n"
-        f"<b>───────────────</b>\n{stats}\n<b>───────────────</b>\n"
-        "Manage your channels using the button below:"
+        "<b>───────────────</b>\n"
+        f"{stats}\n"
+        "<b>───────────────</b>\n"
+        "Manage your input/output channels and send combos easily using the buttons below:"
     )
-    keyboard = [[InlineKeyboardButton("📋 Channels", callback_data=CALLBACK.CHANNELS)]]
+    keyboard = [
+        [InlineKeyboardButton("📋 Channels", callback_data="channels")],
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, reply_markup=reply_markup, parse_mode="HTML"
-        )
-    else:
-        await update.message.reply_text(
-            text, reply_markup=reply_markup, parse_mode="HTML"
-        )
+    await message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="HTML")
 
 
-@admin_only
-async def channels_menu(update: Update, context: CallbackContext):
-    query = update.callback_query
-    await query.answer()
-
-    input_channels = get_db_input_channels()
-    output_channels = get_db_output_channels()
-
-    in_text = "\n".join(input_channels) if input_channels else "None"
-    out_text = (
-        "\n".join([f"`{cid}` ({fname})" for cid, fname in output_channels])
+async def channels_callback(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        query = getattr(update, "callback_query", None)
+        if query:
+            await query.answer()
+            await query.edit_message_text("🚫 You are not authorized to use this bot.")
+        else:
+            await update.message.reply_text(
+                "🚫 You are not authorized to use this bot."
+            )
+        return
+    query = getattr(update, "callback_query", None)
+    input_channels = [
+        row[0] for row in c.execute("SELECT channel_id FROM input_channels")
+    ]
+    output_channels = [
+        (row[0], row[1])
+        for row in c.execute("SELECT channel_id, file_name FROM output_channels")
+    ]
+    text = "📥 Input Channels:\n" + (
+        "\n".join(input_channels) if input_channels else "None"
+    )
+    text += "\n\n📤 Output Channels:\n" + (
+        "\n".join([f"{cid} ({fname})" for cid, fname in output_channels])
         if output_channels
         else "None"
     )
-    text = f"📥 **Input Channels:**\n{in_text}\n\n📤 **Output Channels:**\n{out_text}"
-
+    input_buttons = [
+        [InlineKeyboardButton(f"❌ Delete {cid}", callback_data=f"del_input:{cid}")]
+        for cid in input_channels
+    ]
+    output_buttons = [
+        [InlineKeyboardButton(f"❌ Delete {cid}", callback_data=f"del_output:{cid}")]
+        for cid, _ in output_channels
+    ]
     keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ Add Input Channel", callback_data=CALLBACK.ADD_INPUT
-            )
-        ],
-        *[
-            [
-                InlineKeyboardButton(
-                    f"❌ Delete Input {cid}",
-                    callback_data=f"{CALLBACK.DELETE_INPUT_PREFIX}{cid}",
-                )
-            ]
-            for cid in input_channels
-        ],
-        [
-            InlineKeyboardButton(
-                "📤 Add Output Channel", callback_data=CALLBACK.ADD_OUTPUT
-            )
-        ],
-        *[
-            [
-                InlineKeyboardButton(
-                    f"❌ Delete Output {cid}",
-                    callback_data=f"{CALLBACK.DELETE_OUTPUT_PREFIX}{cid}",
-                )
-            ]
-            for cid, _ in output_channels
-        ],
-        [InlineKeyboardButton("⬅️ Back to Main", callback_data=CALLBACK.BACK_TO_MAIN)],
+        [InlineKeyboardButton("➕ Add Input Channel", callback_data="add_input")],
+        *input_buttons,
+        [InlineKeyboardButton("📤 Add Output Channel", callback_data="add_output")],
+        *output_buttons,
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
-        text, reply_markup=reply_markup, parse_mode="Markdown"
-    )
+    if query:
+        await query.answer()
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
 
-@admin_only
-async def delete_channel(update: Update, context: CallbackContext):
+async def back_to_main_callback(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("🚫 You are not authorized to use this bot.")
+        return
     query = update.callback_query
-    data = query.data
-
-    if data.startswith(CALLBACK.DELETE_INPUT_PREFIX):
-        channel_id = data.replace(CALLBACK.DELETE_INPUT_PREFIX, "")
-        c.execute("DELETE FROM input_channels WHERE channel_id=?", (channel_id,))
-        await query.answer("✅ Input channel deleted.", show_alert=True)
-    elif data.startswith(CALLBACK.DELETE_OUTPUT_PREFIX):
-        channel_id = data.replace(CALLBACK.DELETE_OUTPUT_PREFIX, "")
-        c.execute("DELETE FROM output_channels WHERE channel_id=?", (channel_id,))
-        await query.answer("✅ Output channel deleted.", show_alert=True)
-
-    conn.commit()
-    await channels_menu(update, context)
+    await query.answer()
+    await start(update, context)
 
 
-@admin_only
-async def ask_input_channel(update: Update, context: CallbackContext):
-    await update.callback_query.answer()
-    await update.callback_query.edit_message_text(
-        "Please send the numeric ID of the input channel."
-    )
-    return STATE.ADD_INPUT
-
-
-@admin_only
-async def save_input_channel(update: Update, context: CallbackContext):
-    channel_id = update.message.text.strip()
-    if not channel_id.lstrip("-").isdigit():
-        await update.message.reply_text("❌ Invalid ID. Please send a numeric ID.")
+async def callback_query_handler(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("🚫 You are not authorized to use this bot.")
+        return ConversationHandler.END
+    query = update.callback_query
+    if query.data == "channels":
+        await channels_callback(update, context)
+    elif query.data == "add_input":
+        return await add_input_channel(update, context)
+    elif query.data == "add_output":
+        return await add_output_channel(update, context)
+    elif query.data == "back_to_main":
+        await back_to_main_callback(update, context)
+    elif query.data.startswith("del_input:"):
+        cid = query.data.split(":", 1)[1]
+        c.execute("DELETE FROM input_channels WHERE channel_id=?", (cid,))
+        conn.commit()
+        await query.answer("Input channel deleted.")
+        await channels_callback(update, context)
+        return ConversationHandler.END
+    elif query.data.startswith("del_output:"):
+        cid = query.data.split(":", 1)[1]
+        c.execute("DELETE FROM output_channels WHERE channel_id=?", (cid,))
+        conn.commit()
+        await query.answer("Output channel deleted.")
+        await channels_callback(update, context)
+        return ConversationHandler.END
+    elif query.data == "skip_rights":
+        await query.answer()
+        channel_id, file_name = context.user_data.get(
+            "pending_output_channel", ("", "results.txt")
+        )
+        await query.edit_message_text(
+            f"✅ Output channel added: {channel_id} with file name: {file_name}"
+        )
+        await channels_callback(update, context)
         return ConversationHandler.END
 
+
+async def add_input_channel(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 You are not authorized to use this bot.")
+        return ConversationHandler.END
+    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="channels")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    message = getattr(update, "message", None)
+    if message is None and hasattr(update, "callback_query"):
+        message = update.callback_query.message
+    article = (
+        "<b>Input Channel</b>\n"
+        "<b>───────────────</b>\n"
+        "Enter the numeric ID of the Telegram channel or group to receive combo files.\n"
+        "<i>Example: -123456789</i>"
+    )
+    await message.reply_text(
+        f"{article}\n\nSend the input channel ID:",
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
+    return ADD_INPUT
+
+
+async def save_input_channel(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 You are not authorized to use this bot.")
+        return ConversationHandler.END
+    channel_id = update.message.text.strip()
+    try:
+        int(channel_id)
+    except ValueError:
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="channels")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "❌ Invalid channel ID format. Please send a numeric ID.",
+            reply_markup=reply_markup,
+        )
+        return ConversationHandler.END
     c.execute(
         "INSERT OR IGNORE INTO input_channels (channel_id) VALUES (?)", (channel_id,)
     )
     conn.commit()
-    await update.message.reply_text(
-        f"✅ Input channel `{channel_id}` added successfully."
+    global input_channels
+    input_channels = set(
+        row[0] for row in c.execute("SELECT channel_id FROM input_channels")
     )
+    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="channels")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(f"✅ Input channel added: {channel_id}")
+    await channels_callback(update, context)
     return ConversationHandler.END
 
 
-@admin_only
-async def ask_output_channel(update: Update, context: CallbackContext):
-    await update.callback_query.answer()
-    await update.callback_query.edit_message_text(
-        "Send the output channel ID and the desired .txt file name, separated by a comma.\n\n"
-        "Example: `-123456789,Hotmail_Results.txt`"
+async def add_output_channel(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 You are not authorized to use this bot.")
+        return ConversationHandler.END
+    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="channels")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    message = getattr(update, "message", None)
+    if message is None and hasattr(update, "callback_query"):
+        message = update.callback_query.message
+    article = (
+        "<b>Output Channel</b>\n"
+        "<b>───────────────</b>\n"
+        "Enter the channel ID and .txt file name separated by a comma.\n"
+        "<i>Example: -123456789,results.txt</i>"
     )
-    return STATE.ADD_OUTPUT
+    await message.reply_text(
+        f"{article}\n\nSend the output channel ID and txt file name:",
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
+    return ADD_OUTPUT
 
 
-@admin_only
 async def save_output_channel(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 You are not authorized to use this bot.")
+        return ConversationHandler.END
     try:
-        parts = [p.strip() for p in update.message.text.split(",")]
+        parts = [p.strip() for p in update.message.text.strip().split(",")]
         channel_id = parts[0]
         file_name = parts[1] if len(parts) > 1 else "results.txt"
-
-        if not channel_id.lstrip("-").isdigit() or not file_name.endswith(".txt"):
-            raise ValueError("Invalid format")
-
-        context.user_data["pending_output"] = (channel_id, file_name)
-
-        keyboard = [
-            [InlineKeyboardButton("⏭️ Skip", callback_data=CALLBACK.SKIP_RIGHTS)]
+        context.user_data["pending_output_channel"] = (channel_id, file_name)
+        c.execute(
+            "INSERT OR IGNORE INTO output_channels (channel_id, file_name) VALUES (?, ?)",
+            (channel_id, file_name),
+        )
+        conn.commit()
+        global output_channels
+        output_channels = [
+            (row[0], row[1])
+            for row in c.execute("SELECT channel_id, file_name FROM output_channels")
         ]
+        keyboard = [[InlineKeyboardButton("⏭️ Skip", callback_data="skip_rights")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            "✅ Output channel details received. Now, send the 'rights' emails (one per line or separated by spaces), or press Skip.",
-            reply_markup=reply_markup,
+            "Send the rights emails (one per line, format: email:pass).\nOr press Skip if you don't want to add any.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⏭️ Skip", callback_data="skip_rights")]]
+            ),
         )
-        return STATE.ADD_RIGHTS
-
-    except (ValueError, IndexError):
+        return "RIGHTS_EMAILS"
+    except Exception:
         await update.message.reply_text(
-            "❌ Invalid format. Please use: `channel_id,file_name.txt`"
+            "❌  Invalid channel ID or file name format. Please use the format: <code>channel_id,file_name</code>",
         )
+    return ConversationHandler.END
+
+
+async def save_rights_emails(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 You are not authorized to use this bot.")
         return ConversationHandler.END
-
-
-@admin_only
-async def save_rights_emails(update: Update, context: CallbackContext, skipped=False):
-    channel_id, file_name = context.user_data.get("pending_output")
-
+    rights_emails = re.split(r"[\s,]+", update.message.text.strip())
+    rights_emails = [email for email in rights_emails if email]
+    channel_id, file_name = context.user_data.get(
+        "pending_output_channel", ("", "results.txt")
+    )
     c.execute(
         "INSERT OR IGNORE INTO output_channels (channel_id, file_name) VALUES (?, ?)",
         (channel_id, file_name),
     )
-
-    message_text = (
-        f"✅ Output channel `{channel_id}` with file `{file_name}` added successfully."
-    )
-
-    if not skipped:
-        rights_emails = re.split(r"[\s,]+", update.message.text.strip())
-        rights_emails = [email for email in rights_emails if ":" in email]
-
-        if rights_emails:
-            c.executemany(
-                "INSERT OR IGNORE INTO channel_rights_emails (channel_id, email) VALUES (?, ?)",
-                [(channel_id, email) for email in rights_emails],
-            )
-            c.executemany(
-                "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
-                [(email.split(":", 1)[0], "rights") for email in rights_emails],
-            )
-            message_text += f"\nSaved {len(rights_emails)} rights emails."
-
     conn.commit()
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            message_text, parse_mode="Markdown"
+    global output_channels
+    output_channels = [
+        (row[0], row[1])
+        for row in c.execute("SELECT channel_id, file_name FROM output_channels")
+    ]
+    for email in rights_emails:
+        c.execute(
+            "INSERT OR IGNORE INTO channel_rights_emails (channel_id, email) VALUES (?, ?)",
+            (channel_id, email),
         )
-    else:
-        await update.message.reply_text(message_text, parse_mode="Markdown")
-
-    context.user_data.pop("pending_output", None)
+        c.execute(
+            "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
+            (email, "rights"),
+        )
+    conn.commit()
+    await update.message.reply_text(
+        f"✅ Output channel added: {channel_id} with file name: {file_name}\nRights emails saved."
+    )
+    await channels_callback(update, context)
     return ConversationHandler.END
 
 
-@admin_only
-async def skip_rights_handler(update: Update, context: CallbackContext):
-    await update.callback_query.answer()
-    return await save_rights_emails(update, context, skipped=True)
+async def handle_document(update: Update, context: CallbackContext):
+    global input_channels, output_channels
+    message = (
+        update.message if update.message else getattr(update, "channel_post", None)
+    )
+    chat_id = str(update.effective_chat.id)
+    if chat_id not in input_channels:
+        return
+    documents = []
+    if message and getattr(message, "document", None):
+        documents.append(message.document)
+    if message and hasattr(message, "media_group_id") and message.media_group_id:
+        recent_msgs = context.chat_data.get("recent_msgs", [])
+        for msg in recent_msgs:
+            if getattr(msg, "document", None):
+                documents.append(msg.document)
+    if not documents:
+        return
+    for doc in documents:
+        file = await doc.get_file()
+        base_name = doc.file_name
+        file_path = os.path.join(TEMP_DIR, base_name)
+        counter = 1
+        while os.path.exists(file_path):
+            name, ext = os.path.splitext(base_name)
+            file_path = os.path.join(TEMP_DIR, f"{name}_{counter}{ext}")
+            counter += 1
+        await file.download_to_drive(file_path)
+        with open(file_path, "r", encoding="utf-8") as f:
+            combos = [line.strip() for line in f if line.strip()]
 
-
-async def process_document_file(file_path: str):
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            all_lines = {line.strip() for line in f if ":" in line.strip()}
-
-        db_emails = {row[0] for row in c.execute("SELECT email FROM emails")}
-        new_combos = {
-            line for line in all_lines if line.split(":", 1)[0] not in db_emails
-        }
-
-        if not new_combos:
-            print("[PROCESS] No new combos to process.")
-            return
-
-        valid_combos = filter_combos("\n".join(new_combos))
-        valid_set = set(valid_combos)
-        invalid_combos = new_combos - valid_set
-
-        db_updates = []
-        db_updates.extend([(combo.split(":", 1)[0], "valid") for combo in valid_combos])
-        db_updates.extend(
-            [(combo.split(":", 1)[0], "invalid") for combo in invalid_combos]
-        )
-
-        if db_updates:
-            c.executemany(
-                "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)", db_updates
-            )
-            conn.commit()
-            print(f"[DB] Updated status for {len(db_updates)} emails.")
-
-        output_channels = get_db_output_channels()
-        for out_id, out_fname in output_channels:
-            if len(valid_combos) <= 100:
-                print(
-                    f"[SEND] Skipping channel {out_id}: Not enough valid combos ({len(valid_combos)})."
-                )
+        c.execute("SELECT email, status FROM emails")
+        db_emails = {row[0]: row[1] for row in c.fetchall()}
+        new_combos = []
+        for line in combos:
+            try:
+                email, _ = line.split(":", 1)
+                if email not in db_emails:
+                    new_combos.append(line)
+            except ValueError:
                 continue
 
-            combos_to_write = valid_combos.copy()
-            rights_emails = [
-                row[0]
-                for row in c.execute(
-                    "SELECT email FROM channel_rights_emails WHERE channel_id=?",
-                    (out_id,),
+        valid_combos = []
+        invalid_combos = []
+        for line in new_combos:
+            try:
+                email, _ = line.split(":", 1)
+                result = checker_combo(line)
+                if result:
+                    valid_combos.append(line)
+                    c.execute(
+                        "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
+                        (email, "valid"),
+                    )
+                else:
+                    invalid_combos.append(line)
+                    if ":" in line:
+                        spam_email = line.split(":", 1)[0]
+                    else:
+                        spam_email = line
+                    c.execute(
+                        "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
+                        (spam_email, "invalid"),
+                    )
+            except Exception:
+                c.execute(
+                    "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
+                    (line, "invalid"),
                 )
-            ]
+                invalid_combos.append(line)
+        conn.commit()
 
+        for out_id, file_name in output_channels:
+            out_path = os.path.join(TEMP_DIR, file_name)
+            combos_to_write = valid_combos.copy()
+            c.execute(
+                "SELECT email FROM channel_rights_emails WHERE channel_id=?", (out_id,)
+            )
+            rights_emails = [row[0] for row in c.fetchall()]
             if combos_to_write and rights_emails:
-                num_rights = int(0.4 * len(combos_to_write))
-                selected_rights = random.choices(rights_emails, k=num_rights)
+                import random
+
+                n_rights = int(0.4 * len(combos_to_write))
+                selected_rights = []
+                while len(selected_rights) < n_rights:
+                    selected_rights.append(random.choice(rights_emails))
                 for email in selected_rights:
-                    combos_to_write.insert(
-                        random.randint(0, len(combos_to_write)), email
+                    attempts = 0
+                    while True:
+                        pos = random.randint(0, len(combos_to_write))
+                        if (pos > 0 and combos_to_write[pos - 1] == email) or (
+                            pos < len(combos_to_write) and combos_to_write[pos] == email
+                        ):
+                            attempts += 1
+                            if attempts > 50:
+                                break
+                            continue
+                        combos_to_write.insert(pos, email)
+                        break
+            if len(combos_to_write) <= 100:
+                continue
+            with open(out_path, "w", encoding="utf-8") as f:
+                for line in combos_to_write:
+                    f.write(line + "\n")
+            if len(combos_to_write) == 0:
+                continue
+            try:
+                await telethon_client.send_file(
+                    int(out_id),
+                    out_path,
+                    mime_type="text/plain",
+                )
+            except Exception as e:
+                if message:
+                    await message.reply_text(
+                        f"Telethon error sending to output channel {out_id}: {e}"
                     )
 
-            output_path = os.path.join(TEMP_DIR, out_fname)
-
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(combos_to_write))
-
-            try:
-                await telethon_client.send_file(int(out_id), output_path)
-                print(f"[SEND] File sent to channel {out_id}.")
-            except Exception as e:
-                print(f"[ERROR] Failed to send file to {out_id}: {e}")
-            finally:
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-
-    except Exception as e:
-        print(f"[ERROR] An error occurred in process_document_file: {e}")
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"[CLEANUP] Deleted temp file: {file_path}")
+    for filename in os.listdir(TEMP_DIR):
+        file_path = os.path.join(TEMP_DIR, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
 
 
-@telethon_client.on(events.NewMessage)
-async def telethon_handler(event):
-    input_channels = get_db_input_channels()
-    if str(event.chat_id) not in input_channels:
-        return
+async def process_document_file(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        combos = [line.strip() for line in f if line.strip()]
+    c.execute("SELECT email, status FROM emails")
+    db_emails = {row[0]: row[1] for row in c.fetchall()}
+    new_combos = []
+    for line in combos:
+        try:
+            email, _ = line.split(":", 1)
+            if email not in db_emails:
+                new_combos.append(line)
+        except ValueError:
+            continue
+    valid_combos = []
+    invalid_combos = []
+    for line in new_combos:
+        try:
+            email, _ = line.split(":", 1)
+            result = checker_combo(line)
+            if result:
+                valid_combos.append(line)
+                c.execute(
+                    "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
+                    (email, "valid"),
+                )
+            else:
+                invalid_combos.append(line)
+                if ":" in line:
+                    spam_email = line.split(":", 1)[0]
+                else:
+                    spam_email = line
+                c.execute(
+                    "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
+                    (spam_email, "invalid"),
+                )
+        except Exception:
+            c.execute(
+                "INSERT OR IGNORE INTO emails (email, status) VALUES (?, ?)",
+                (line, "invalid"),
+            )
+            invalid_combos.append(line)
+    conn.commit()
+    for out_id, file_name in output_channels:
+        out_path = os.path.join(TEMP_DIR, file_name)
+        combos_to_write = valid_combos.copy()
+        c.execute(
+            "SELECT email FROM channel_rights_emails WHERE channel_id=?", (out_id,)
+        )
+        rights_emails = [row[0] for row in c.fetchall()]
+        if combos_to_write and rights_emails:
+            import random
 
-    if (
-        not event.file
-        or not event.file.name
-        or not event.file.name.lower().endswith(".txt")
-    ):
-        return
+            n_rights = int(0.4 * len(combos_to_write))
+            selected_rights = []
+            while len(selected_rights) < n_rights:
+                selected_rights.append(random.choice(rights_emails))
+            for email in selected_rights:
+                attempts = 0
+                while True:
+                    pos = random.randint(0, len(combos_to_write))
+                    if (pos > 0 and combos_to_write[pos - 1] == email) or (
+                        pos < len(combos_to_write) and combos_to_write[pos] == email
+                    ):
+                        attempts += 1
+                        if attempts > 50:
+                            break
+                        continue
+                    combos_to_write.insert(pos, email)
+                    break
+        if len(combos_to_write) <= 100:
+            continue
+        with open(out_path, "w", encoding="utf-8") as f:
+            for line in combos_to_write:
+                f.write(line + "\n")
+        if len(combos_to_write) == 0:
+            continue
+        try:
+            await telethon_client.send_file(
+                int(out_id),
+                out_path,
+                mime_type="text/plain",
+            )
+        except Exception as e:
+            pass
+    for filename in os.listdir(TEMP_DIR):
+        file_path = os.path.join(TEMP_DIR, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
 
-    print(
-        f"[TELETHON] Detected .txt file '{event.file.name}' in channel {event.chat_id}."
-    )
 
-    if not os.path.exists(TEMP_DIR):
-        os.makedirs(TEMP_DIR)
-
-    file_path = os.path.join(
-        TEMP_DIR, f"{random.randint(1000, 9999)}_{event.file.name}"
-    )
-
-    try:
+def setup_telethon_handlers():
+    @telethon_client.on(events.NewMessage(chats=[int(cid) for cid in input_channels]))
+    async def telethon_handle_document(event):
+        if not event.file or not event.file.name.endswith(".txt"):
+            return
+        if not os.path.exists(TEMP_DIR):
+            os.makedirs(TEMP_DIR)
+        base_name = event.file.name
+        file_path = os.path.join(TEMP_DIR, base_name)
+        counter = 1
+        while os.path.exists(file_path):
+            name, ext = os.path.splitext(base_name)
+            file_path = os.path.join(TEMP_DIR, f"{name}_{counter}{ext}")
+            counter += 1
         await event.download_media(file_path)
-        print(f"[DOWNLOAD] File downloaded to {file_path}")
+        if not os.path.exists(file_path):
+            return
         await process_document_file(file_path)
-    except Exception as e:
-        print(f"[ERROR] Failed to download or process file: {e}")
-        if os.path.exists(file_path):
-            os.remove(file_path)

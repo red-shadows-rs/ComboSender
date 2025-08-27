@@ -1,106 +1,86 @@
 import os
 import asyncio
+import importlib.util
+import telegram
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     filters,
+    CallbackContext,
     ConversationHandler,
     CallbackQueryHandler,
 )
 from src.session.telethon_session import telethon_client, telethon_login
+from src.data.database import conn, c
 from src.bot.handlers import (
     start,
-    ask_input_channel,
+    add_input_channel,
     save_input_channel,
-    ask_output_channel,
+    add_output_channel,
     save_output_channel,
     save_rights_emails,
-    channels_menu,
-    delete_channel,
-    skip_rights_handler,
-    STATE,
-    CALLBACK,
+    handle_document,
+    callback_query_handler,
+    setup_telethon_handlers,
 )
 from config import TELEGRAM_BOT_TOKEN
 
+TEMP_DIR = "temp"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-def main():
-    if not os.path.exists("temp"):
-        os.makedirs("temp")
+ADD_INPUT, ADD_OUTPUT = range(2)
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(ask_input_channel, pattern=f"^{CALLBACK.ADD_INPUT}$"),
-            CallbackQueryHandler(
-                ask_output_channel, pattern=f"^{CALLBACK.ADD_OUTPUT}$"
-            ),
+conv_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("add_input", add_input_channel),
+        CommandHandler("add_output", add_output_channel),
+        CallbackQueryHandler(add_input_channel, pattern="^add_input$"),
+        CallbackQueryHandler(add_output_channel, pattern="^add_output$"),
+    ],
+    states={
+        ADD_INPUT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, save_input_channel)
         ],
-        states={
-            STATE.ADD_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_input_channel)
-            ],
-            STATE.ADD_OUTPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_output_channel)
-            ],
-            STATE.ADD_RIGHTS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_rights_emails),
-                CallbackQueryHandler(
-                    skip_rights_handler, pattern=f"^{CALLBACK.SKIP_RIGHTS}$"
-                ),
-            ],
-        },
-        fallbacks=[
-            CallbackQueryHandler(channels_menu, pattern=f"^{CALLBACK.CHANNELS}$")
+        ADD_OUTPUT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, save_output_channel)
         ],
-        per_message=False,
-        allow_reentry=True,
-    )
+        "RIGHTS_EMAILS": [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, save_rights_emails)
+        ],
+    },
+    fallbacks=[],
+)
 
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("start", start))
+app.add_handler(conv_handler)
+app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+app.add_handler(CallbackQueryHandler(callback_query_handler))
 
-    application.add_handler(
-        CallbackQueryHandler(start, pattern=f"^{CALLBACK.BACK_TO_MAIN}$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(channels_menu, pattern=f"^{CALLBACK.CHANNELS}$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(delete_channel, pattern=f"^{CALLBACK.DELETE_INPUT_PREFIX}")
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            delete_channel, pattern=f"^{CALLBACK.DELETE_OUTPUT_PREFIX}"
-        )
-    )
 
-    async def run_bot():
-        await telethon_login()
-
-        async with application:
-            await application.initialize()
-            await application.start()
-
-            asyncio.create_task(telethon_client.run_until_disconnected())
-
-            await application.updater.start_polling()
-            print("🤖 Bot is running and listening for updates...")
-            await asyncio.Event().wait()
-
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
-
-    try:
-        asyncio.run(run_bot())
-    except (KeyboardInterrupt, SystemExit):
-        print("Bot stopped.")
+async def main():
+    await telethon_login()
+    setup_telethon_handlers()
+    asyncio.create_task(telethon_client.run_until_disconnected())
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
+    await app.stop()
+    await app.shutdown()
 
 
 if __name__ == "__main__":
+    missing = []
+    for pkg in ["telethon"]:
+        if importlib.util.find_spec(pkg) is None:
+            missing.append(pkg)
+    if missing:
+        print(
+            f"\n⚠️ Required packages are missing: {', '.join(missing)}\nPlease run: pip install -r requirements.txt\n"
+        )
     print(
         """
 🤖 ComboSender Dashboard Bot
@@ -113,4 +93,4 @@ GitHub: https://github.com/red-shadows-rs
 Bot is starting...
 """
     )
-    main()
+    asyncio.run(main())
